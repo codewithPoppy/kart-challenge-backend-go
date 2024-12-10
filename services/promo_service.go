@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
 
 // PromoCodeFiles contains the paths to the promo code files
@@ -24,22 +25,40 @@ func ValidatePromoCode(code string) (bool, error) {
 		return false, errors.New("invalid promo code length")
 	}
 
-	// Rule 2: Check presence in at least two files
+	// Rule 2: Check presence in at least two files concurrently
+	var wg sync.WaitGroup
 	matchCount := 0
+	mu := sync.Mutex{}
+	done := make(chan struct{})
+
 	for _, file := range PromoCodeFiles {
-		if containsCode(file, code) {
-			matchCount++
-		}
-		if matchCount >= 2 {
-			return true, nil
-		}
+		wg.Add(1)
+		go func(filepath string) {
+			defer wg.Done()
+			if containsCode(filepath, code, done) {
+				mu.Lock()
+				matchCount++
+				// Signal to stop further processing if matchCount >= 2
+				if matchCount >= 2 {
+					close(done)
+				}
+				mu.Unlock()
+			}
+		}(file)
+	}
+
+	wg.Wait()
+
+	if matchCount >= 2 {
+		return true, nil
 	}
 
 	return false, errors.New("promo code not valid in at least two files")
 }
 
 // containsCode checks if a promo code exists in the given gzip file
-func containsCode(filepath string, code string) bool {
+// Stops reading further if the done channel is closed
+func containsCode(filepath string, code string, done <-chan struct{}) bool {
 	file, err := os.Open(filepath)
 	if err != nil {
 		return false
@@ -53,12 +72,28 @@ func containsCode(filepath string, code string) bool {
 	}
 	defer gzReader.Close()
 
-	// Read the file
-	content, err := io.ReadAll(gzReader)
-	if err != nil {
-		return false
+	// Create a buffered reader for line-by-line reading
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-done:
+			return false
+		default:
+		}
+
+		n, err := gzReader.Read(buf)
+		if err != nil && err != io.EOF {
+			return false
+		}
+		if n == 0 {
+			break
+		}
+
+		// Check if the promo code is in the current chunk
+		if strings.Contains(string(buf[:n]), code) {
+			return true
+		}
 	}
 
-	// Check if the promo code is in the file
-	return strings.Contains(string(content), code)
+	return false
 }
